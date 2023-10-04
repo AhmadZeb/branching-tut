@@ -1,1 +1,327 @@
-this is version 1 asfsdfsdfsdf
+// Copyright (c) David Pine. All rights reserved.
+// Licensed under the MIT License.
+
+using Azure.Core;
+using OutSquareTM.Infrastructure.Repository.TwilioRepository;
+using System.Security.Claims;
+
+namespace OutSquareTM.Api.Extensions;
+
+internal static class WebApplicationExtensions
+{
+    /// <summary>
+    /// Maps the following APIs on the <c>"api/twilio"</c> route:
+    /// <list type="bullet">
+    /// <item>
+    /// HTTP GET: <c>"api/twilio/token"</c> - returns a <see cref="TwilioJwt"/> to use for future API calls.
+    /// </item>
+    /// <item>
+    /// HTTP GET: <c>"api/twilio/rooms"</c> - returns a collection of <see cref="RoomDetails"/> (only in-progress rooms).
+    /// </item>
+    /// </list>
+    /// </summary>
+    internal static WebApplication MapTwilioApi(this WebApplication app)
+    {
+        var twilioApi = app.MapGroup("api/twilio");
+        twilioApi.MapGet(
+            "token",
+            static (TwilioService twilioService, string? userName, string? roomName) => twilioService.GetTwilioJwt(userName, roomName));
+        twilioApi.MapGet(
+            "rooms",
+            static (TwilioService twilioService) => twilioService.GetAllRoomsAsync());
+        twilioApi.MapGet(
+           "createrooms",
+           static (TwilioService twilioService, string? userId) => twilioService.CreateRoom(userId));
+        twilioApi.MapPost(
+           "closeroom",
+           static (TwilioService twilioService, string? roomSid) => twilioService.CancelAndCloseVideoCall(roomSid));
+        return app;
+    }
+}
+
+
+
+
+repo
+
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using Twilio.Base;
+using Twilio.Jwt.AccessToken;
+using Twilio.Rest.Video.V1;
+using Twilio;
+
+using Twilio.Rest.Video.V1.Room;
+using ParticipantStatus = Twilio.Rest.Video.V1.Room.ParticipantResource.StatusEnum;
+using OutSquareTM.Core.Options;
+using OutSquareTM.Core.VideoModels;
+using Microsoft.IdentityModel.Tokens;
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using Microsoft.Extensions.Configuration;
+using Twilio.Exceptions;
+using Azure.Core;
+using OutSquareTM.Core.Entities.VideoModels;
+using Microsoft.AspNetCore.Http.HttpResults;
+using OutSquareTM.Core.Entities.UserModel;
+using static Twilio.Rest.Video.V1.CompositionResource;
+using static Twilio.Rest.Video.V1.RoomResource;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Identity.Client;
+using System.Threading;
+using OutSquareTM.Application.Dto.Doctors;
+using OutSquareTM.Common.Response;
+using System.Net;
+using OutSquareTM.Application.Interfaces.VideoSession;
+using Microsoft.AspNetCore.Authentication;
+
+namespace OutSquareTM.Infrastructure.Repository.TwilioRepository
+{
+    public sealed class TwilioService
+    {
+        readonly TwilioSettings _twilioSettings;
+        private readonly IConfiguration _configuration;
+        private readonly IVideoSessionRepository _sessionRepository;
+        private IHttpContextAccessor _httpContextAccessor;
+        public TwilioService(Microsoft.Extensions.Options.IOptions<TwilioSettings> twilioOptions, IConfiguration configuration, IVideoSessionRepository videoSessionRepository, IHttpContextAccessor httpContextAccessor)
+        {
+            _twilioSettings =
+                twilioOptions?.Value ??
+                throw new ArgumentNullException(nameof(twilioOptions));
+
+            TwilioClient.Init(
+                _twilioSettings.AccountSid ?? "no-key",
+                _twilioSettings.TwillioApiKey ?? "no-secret");
+            _configuration = configuration;
+            _sessionRepository = videoSessionRepository;
+            _httpContextAccessor = httpContextAccessor;
+        }
+        // Join an existing video room
+        public async Task<BaseResponse<string>> GetTwilioJwt(string? identity, string? roomName)
+        {
+            try
+            {
+                var accessToken = await _httpContextAccessor.HttpContext.GetTokenAsync("access_token");
+                identity = string.IsNullOrEmpty(identity) ? GetUserName(accessToken) : identity;
+
+                // Create a VideoGrant with the desired room name.
+                var videoGrant = new VideoGrant
+                {
+                    Room = roomName
+                };
+
+                var token = new Token(
+                    _twilioSettings.AccountSid,
+                    _twilioSettings.TwillioApiKey,
+                    _twilioSettings.ApiSecret,
+                    identity,
+                    grants: new HashSet<IGrant> { videoGrant });
+
+                var jwt = token.ToJwt();
+                var response = new BaseResponse<string>
+                {
+                    Token = jwt,
+                };
+
+                // Return the successful response.
+                return new BaseResponse<string>(HttpStatusCode.Created, "Successfully Retrieve Response", response.Token);
+            }
+            catch (Exception ex)
+            {
+                // Return an error response with the exception message.
+                return new BaseResponse<string>(HttpStatusCode.InternalServerError, "Internal Server Error");
+            }
+        }
+
+
+        public async Task<BaseResponse<RoomCreationResult>> CreateRoom(string? userId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(userId))
+                {
+                    return new BaseResponse<RoomCreationResult>(HttpStatusCode.BadRequest, "User ID is required.");
+                }
+
+                var accessToken = await _httpContextAccessor.HttpContext.GetTokenAsync("access_token");
+                var uniqueName = GetUserName(accessToken);
+
+                if (string.IsNullOrEmpty(uniqueName))
+                {
+                    return new BaseResponse<RoomCreationResult>(HttpStatusCode.InternalServerError, "Unable to retrieve unique name.");
+                }
+
+                string uniqueRoomName = GetUniqueRoomName(userId, uniqueName);
+
+                var room = RoomResource.Create(
+                    uniqueName: uniqueRoomName,
+                    type: RoomResource.RoomTypeEnum.Group,
+                    recordParticipantsOnConnect: false
+                );
+
+                var videoSession = new RoomCreationResult
+                {
+                    RoomName = uniqueRoomName,
+                    RoomSid = room.Sid,
+                    UserId = userId,
+                };
+
+                await _sessionRepository.InsertVideoSession(videoSession);
+
+                return new BaseResponse<RoomCreationResult>(HttpStatusCode.Created, "Successfully Create Room", videoSession);
+            }
+            catch (TwilioException ex)
+            {
+                // Log the Twilio room creation exception here.
+                return new BaseResponse<RoomCreationResult>(HttpStatusCode.InternalServerError, "An error occurred while creating the room.");
+            }
+            catch (Exception ex)
+            {
+                // Log other exceptions here.
+                return new BaseResponse<RoomCreationResult>(HttpStatusCode.InternalServerError, ex.Message);
+            }
+        }
+
+        private string GetUniqueRoomName(string? userId, string? uniqueName)
+        {
+            if (string.IsNullOrEmpty(userId) || string.IsNullOrEmpty(uniqueName))
+            {
+                return string.Empty; // Handle this case appropriately in the calling code.
+            }
+
+            // Generate a unique room name based on the user's ID, uniqueName, and a timestamp
+            return $"{userId}_Room_{DateTime.Now:yyyyMMddHHmmss}";
+        }
+
+        public void CompleteRoom(string roomName)
+        {
+            // replace roomname with sid
+            var ApiKeySid = _twilioSettings.TwillioApiKey;
+            var ApiKeySecret = _twilioSettings.ApiSecret;
+            TwilioClient.Init(ApiKeySid, ApiKeySecret);
+
+            var rooms = RoomResource.Read(uniqueName: roomName, limit: 20);
+            // Todo : check for null room here
+            var firstRoom = rooms.FirstOrDefault();
+
+
+            if (firstRoom != null && !(rooms.FirstOrDefault().Status == RoomStatusEnum.Completed))
+            {
+                var roomSid = firstRoom.Sid;
+                var room = RoomResource.Update(
+                  status: RoomResource.RoomStatusEnum.Completed,
+                  pathSid: roomSid
+                );
+                ComposeRoomInGrid(roomSid);
+            }
+        }
+        private void ComposeRoomInGrid(string roomId)
+        {
+            var ApiKeySid = _twilioSettings.TwillioApiKey;
+            var ApiKeySecret = _twilioSettings.ApiSecret;
+
+            TwilioClient.Init(ApiKeySid, ApiKeySecret);
+
+            var layout = new
+            {
+                grid = new
+                {
+                    video_sources = new string[] { "*" }
+                }
+            };
+
+            var composition = CompositionResource.Create(
+              roomSid: roomId,
+              audioSources: new List<string> { "*" },
+              videoLayout: layout,
+              //   statusCallback: new Uri(@"http://my.server.org/callbacks"),
+              format: FormatEnum.Mp4
+            );
+        }
+        public async Task<BaseResponse<IEnumerable<RoomDetails>>> GetAllRoomsAsync()
+        {
+            try
+            {
+                // TwilioClient.Init(_twilioSettings.AccountSid, _twilioSettings.TwillioApiKey);
+                // string uniqueName = GetName(accessToken);
+                var rooms = await RoomResource.ReadAsync(
+                    status: RoomResource.RoomStatusEnum.InProgress,
+                    limit: 20
+                );
+
+                var tasks = rooms.Select(async room =>
+                {
+                    var participantTask = ParticipantResource.ReadAsync(room.Sid, ParticipantStatus.Connected);
+                    var participants = (await participantTask).Count();
+                    return new RoomDetails(
+                        room.Sid,
+                        room.UniqueName,
+                        participants,
+                        room.MaxParticipants ?? 0
+                    );
+                });
+
+                var roomDetails = await Task.WhenAll(tasks);
+
+                return new BaseResponse<IEnumerable<RoomDetails>>(HttpStatusCode.Created, "Successfully Retrieve Room", roomDetails);
+            }
+            catch (Exception)
+            {
+                return new BaseResponse<IEnumerable<RoomDetails>>(HttpStatusCode.InternalServerError, "Internal Server Error");
+            }
+        }
+
+
+        public BaseResponse<string> CancelAndCloseVideoCall(string? roomSid)
+        {
+            try
+            {
+                var call = RoomResource.Fetch(roomSid);
+
+                if (call.Status != RoomResource.RoomStatusEnum.InProgress)
+                {
+                    return new BaseResponse<string>(HttpStatusCode.InternalServerError, "Call is not in progress and cannot be canceled.");
+                }
+                RoomResource.Update(roomSid, status: RoomResource.RoomStatusEnum.Completed);
+                return new BaseResponse<string>(HttpStatusCode.OK, "Call Close Successfully");
+            }
+            catch (Exception ex)
+            {
+                return new BaseResponse<string>(HttpStatusCode.InternalServerError, "Internal Server Error");
+            }
+        }
+        #region 
+        public string GetUserName(string? accessToken)
+        {
+            var username = string.Empty;
+            var principal = GetPrincipalFromExpiredToken(accessToken);
+            username = principal.Identity.Name;
+            return username;
+        }
+        private ClaimsPrincipal? GetPrincipalFromExpiredToken(string? token)
+        {
+            var tokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateAudience = false,
+                ValidateIssuer = false,
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_configuration["JWT:Key"])),
+                ValidateLifetime = false
+            };
+
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var principal = tokenHandler.ValidateToken(token, tokenValidationParameters, out SecurityToken securityToken);
+            if (securityToken is not JwtSecurityToken jwtSecurityToken || !jwtSecurityToken.Header.Alg.Equals(SecurityAlgorithms.HmacSha256, StringComparison.InvariantCultureIgnoreCase))
+                throw new SecurityTokenException("Invalid token");
+
+            return principal;
+
+        }
+        #endregion
+    }
+}
